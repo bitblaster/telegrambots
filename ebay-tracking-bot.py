@@ -60,7 +60,7 @@ def createItemDescription(item):
         desc += ", Offerte: %d" % item['num_bids']
 
     if item['end_date']:
-        desc += "\nScadenza: *%s*" % item['end_date'].strftime('%d/%m/%Y %H:%M:%S')
+        desc += "\nScadenza: <b>%s</b>" % item['end_date'].strftime('%d/%m/%Y %H:%M:%S')
     
     if item['notes']:
         desc += "\nNote: %s" % item['notes']
@@ -75,21 +75,34 @@ def checkEbayItems():
     events = listCalendarEvents()
     for event in events:
         with suppress(KeyError):
-            endDate = datetime.fromisoformat(event['end']['dateTime'])
             lastCrawled = datetime.fromisoformat(event['extendedProperties']['private']['last_crawled'])
+            endDate = datetime.fromisoformat(event['end']['dateTime'])
             delta = endDate - now
-            if delta.days >= 0:
-                if now - lastCrawled > EBAY_ITEM_CRAWLING_INTERVAL or delta < EBAY_ITEM_ALERT_DELTA:
-                    crawledItem = crawlEbayItem(event['source']['url'])
-                    desc = createItemDescription(crawledItem)
-                    if desc != event['description']:
-                        updateCalendarEvent(item)
-                    if delta < EBAY_ITEM_ALERT_DELTA:
-                        bot.sendMessage(data['telegram_chat_id'], "Oggetto in scadenza fra %d minuti!\n%s" % ((delta.seconds-30) / 60 + 1, desc), parse_mode="html")
-    #            else:
-    #                break # Items are sorted by end_date, so no reason to continue
+            if now - lastCrawled > EBAY_ITEM_CRAWLING_INTERVAL or delta < EBAY_ITEM_ALERT_DELTA:
+                crawledItem = crawlEbayItem(event['source']['url'])
+                desc = createItemDescription(crawledItem)
+                if desc != event['description']:
+                    updateCalendarEvent(crawledItem)
+                if delta < EBAY_ITEM_ALERT_DELTA:
+                    bot.sendMessage(data['telegram_chat_id'], "Oggetto in scadenza fra %d minuti!\n%s" % ((delta.seconds-30) / 60 + 1, desc), parse_mode="html")
+#            else:
+#                break # Items are sorted by end_date, so no reason to continue
 
     log.debug("Done checking items...")
+
+def updateAllEbayItems():
+    log.debug("Force updating all items...")
+    
+    events = listCalendarEvents()
+    for event in events:
+        with suppress(KeyError):
+            crawledItem = crawlEbayItem(event['source']['url'])
+            desc = createItemDescription(crawledItem)
+            updateCalendarEvent(crawledItem)
+
+    bot.sendMessage(data['telegram_chat_id'], "Aggiornamento forzato terminato")
+    log.debug("Done force updating all items...")
+
 
 def crawlEbayItem(url):
     if not hasattr(crawlEbayItem, 'htmlparser'):
@@ -193,7 +206,7 @@ def getUrlMd5(url):
     
 def createEvent(item):
     event = {
-      'summary': 'Asta Ebay',
+      'summary': "%s %0.2f" % (item['title'][:30], item['cur_price']),
       'description': createItemDescription(item),
       'start': {
         'dateTime': item['end_date'].isoformat(),
@@ -222,8 +235,11 @@ def createEvent(item):
     return event
 
 def listCalendarEvents():
+    log.debug('Listing calendar events')
     events_result = google_cal_service.events().list(calendarId=data['calendar_id'], timeMin=datetime.now(TZ_CET).isoformat(), maxResults=100, singleEvents=True, orderBy='startTime').execute()
     events = events_result.get('items', [])
+    
+    log.debug('Done listing calendar events')
     return events
 
 def isCalendarEventPresent(url):
@@ -232,23 +248,35 @@ def isCalendarEventPresent(url):
     return len(events) > 0
     
 def addCalendarEvent(item):
+    log.debug('Adding calendar event for item %s' % item['url'])
     event = createEvent(item)
     event = google_cal_service.events().insert(calendarId=data['calendar_id'], body=event).execute()
+    
+    log.debug('Done adding calendar event')
 
 def updateCalendarEvent(item):
+    log.debug('Updating calendar event for item %s' % item['url'])
     events_result = google_cal_service.events().list(calendarId=data['calendar_id'], maxResults=1, privateExtendedProperty="item_url_md5="+getUrlMd5(item['url']), singleEvents=True).execute()
+    
     events = events_result.get('items', [])
 
     if events:
+        log.debug('Event found')
         event = createEvent(item)
         event = google_cal_service.events().update(calendarId=data['calendar_id'], eventId=events[0]['id'], body=event).execute()
+        
+    log.debug('Done updating calendar event')
 
 def deleteCalendarEvent(urlMd5):
+    log.debug('Deleting calendar event for item %s' %urlMd5)
     events_result = google_cal_service.events().list(calendarId=data['calendar_id'], maxResults=1, privateExtendedProperty="item_url_md5="+urlMd5, singleEvents=True).execute()
     events = events_result.get('items', [])
 
     if events:
+        log.debug('Event found')
         google_cal_service.events().delete(calendarId=data['calendar_id'], eventId=events[0]['id']).execute()
+        
+    log.debug('Done deleting calendar event')
 
 def trackEbayItem(chat_id, urls):
     urls = urls.split('\n')
@@ -280,9 +308,9 @@ def chunks(lst, n):
         yield lst[i:i + n]
         
 def removeEbayItem(chat_id):
+    log.debug("Listing items to remove")
     events = listCalendarEvents()
     if events:
-        log.debug("Listing items to remove")
         buttons = []
         i=1
         for event in events:
@@ -291,9 +319,9 @@ def removeEbayItem(chat_id):
             i += 1
     
         bot.sendMessage(chat_id, "Quali oggetti vuoi rimuovere?", reply_markup=InlineKeyboardMarkup(inline_keyboard=list(chunks(buttons, 8))))
-        log.debug("Done listing items to remove")
     else:
         bot.sendMessage(chat_id, "Non ci sono oggetti Ebay tracciati")
+    log.debug("Done listing items to remove")
 
 def on_chat_message(msg):
     global status
@@ -315,6 +343,8 @@ def on_chat_message(msg):
                 printEbayURLs(chat_id)
             elif msg['text'] == '/remove':
                 removeEbayItem(chat_id)
+            elif msg['text'] == '/updateall':
+                updateAllEbayItems()
             else:
                 trackEbayItem(chat_id, msg['text'])
         except:
@@ -373,6 +403,8 @@ bot = telepot.Bot(data['telegram_token'])
 MessageLoop(bot, {'chat': on_chat_message, 'callback_query': on_callback_query}).run_as_thread()
 
 log.info ("Bot started. Listening ...")
+
+checkEbayItems()
 
 # Item check sheduling
 schedule.every(2).minutes.do(checkEbayItems)
