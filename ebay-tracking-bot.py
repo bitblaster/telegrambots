@@ -1,24 +1,23 @@
 #!/usr/bin/python3
-import sys
-import time
-import telepot
+import sys, time, re, os, json, subprocess, pytz, schedule, hashlib, logging, icu, traceback, telepot
 from telepot.loop import MessageLoop
 from telepot.namedtuple import InlineKeyboardMarkup, InlineKeyboardButton
 from telepot.namedtuple import ReplyKeyboardRemove
-import subprocess
-import re, os, json
 from datetime import datetime, timedelta, MAXYEAR
 from google_trans_new import google_translator
-import pytz
-from enum import Enum
 from urllib.parse import urlparse
 from urllib.request import urlopen
 from lxml import etree
-import schedule
-import hashlib
-import logging
-import icu
-import traceback
+from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.errors import HttpError
+from contextlib import suppress
+
+# If modifying these scopes, delete the file token.json.
+GOOGLE_API_SCOPES = ['https://www.googleapis.com/auth/calendar',
+                     'https://www.googleapis.com/auth/calendar.events']
 
 TZ_CET = pytz.timezone('CET')
 DATE_FORMATTER = icu.DateFormat.createDateTimeInstance(icu.DateFormat.MEDIUM,
@@ -39,37 +38,12 @@ def setup_custom_logger(name, level):
     logger.addHandler(screen_handler)
     return logger
 
-def date_serializer(obj):
-    if isinstance(obj, datetime):
-        return { '_isoformat': obj.isoformat() }
-    raise TypeError('...')
-
-def date_parser(obj):
-    _isoformat = obj.get('_isoformat')
-    if _isoformat is not None:
-        return datetime.fromisoformat(_isoformat)
-    return obj
-
 def readDB():
     log.debug("Reading DB")
     with open('ebay-tracking-bot_data.json', 'r', encoding='utf-8') as data_file:
-        data = json.load(data_file, object_hook=date_parser)
+        data = json.load(data_file)
     
     log.debug("Done reading DB")
-    return data
-
-def writeDB(data):
-    log.debug("Writing DB")
-    if not hasattr(crawlEbayItem, 'MAX_DATE'):
-        crawlEbayItem.MAX_DATE = datetime(MAXYEAR, 12, 31, tzinfo=TZ_CET)  # static local variable
-        
-    if data['ebay_items']:
-        data['ebay_items'].sort(key=lambda x: x['end_date'] or crawlEbayItem.MAX_DATE)
-            
-    with open('ebay-tracking-bot_data.json', 'w', encoding='utf-8') as data_file:
-        json.dump(data, data_file, ensure_ascii=False, indent=4, default=date_serializer)
-    
-    log.debug("Done writing DB")
     return data
 
 def urlValidator(x):
@@ -79,63 +53,51 @@ def urlValidator(x):
     except:
         return False
 
-def sendItemMessage(chat_id, item, prefix):
-    msg = "%s%s\n\nPrezzo: *%0.2f*, Sped.: %0.2f"
+def createItemDescription(item):
+    desc = "%s\n\nPrezzo: <b>%0.2f</b>, Sped.: %0.2f" % (item['title'], item['cur_price'], item['shipping_cost'])
     
-    if item['end_date']:
-        now = datetime.now(TZ_CET)
-        if item['end_date'] < now:
-            prefix += "*SCADUTA!!!*\n"
-        msg += ", Scadenza: *%s*" % item['end_date'].strftime('%d/%m/%Y %H:%M:%S')
-        
     if item['num_bids']:
-        msg += ", Offerte: %d" % item['num_bids']
+        desc += ", Offerte: %d" % item['num_bids']
+
+    if item['end_date']:
+        desc += "\nScadenza: *%s*" % item['end_date'].strftime('%d/%m/%Y %H:%M:%S')
     
     if item['notes']:
-        msg += "\nNote: %s" % item['notes']
+        desc += "\nNote: %s" % item['notes']
         
-    msg += "\nURL: %s"
-    msg = msg % (prefix,
-        item['title'], 
-        item['cur_price'], 
-        item['shipping_cost'], 
-        item['url'])
-        
-    bot.sendMessage(chat_id, msg, parse_mode="markdown")
-
+    desc += "\nURL: %s" % item['url']
+    return desc
+    
 def checkEbayItems():
     now = datetime.now(TZ_CET)
     log.debug("Checking items...")
     
-    items = data['ebay_items']
-    if items:
-        for i, item in enumerate(items):
-            if item['end_date']:
-                delta = item['end_date'] - now
-                if delta.days >= 0:
+    events = listCalendarEvents()
+    for event in events:
+        with suppress(KeyError):
+            endDate = datetime.fromisoformat(event['end']['dateTime'])
+            lastCrawled = datetime.fromisoformat(event['extendedProperties']['private']['last_crawled'])
+            delta = endDate - now
+            if delta.days >= 0:
+                if now - lastCrawled > EBAY_ITEM_CRAWLING_INTERVAL or delta < EBAY_ITEM_ALERT_DELTA:
+                    crawledItem = crawlEbayItem(event['source']['url'])
+                    desc = createItemDescription(crawledItem)
+                    if desc != event['description']:
+                        updateCalendarEvent(item)
                     if delta < EBAY_ITEM_ALERT_DELTA:
-                        item = crawlEbayItem(item['url'])
-                        items[i] = item
-                        sendItemMessage(data['telegram_chat_id'], item, "Oggetto in scadenza fra %d minuti!\n" % ((delta.seconds-30) / 60 + 1))
-                    else:
-                        break # Items are sorted by end_date, so no reason to continue
+                        bot.sendMessage(data['telegram_chat_id'], "Oggetto in scadenza fra %d minuti!\n%s" % ((delta.seconds-30) / 60 + 1, desc), parse_mode="html")
+    #            else:
+    #                break # Items are sorted by end_date, so no reason to continue
 
-                    if not item['last_crawled'] or now - item['last_crawled'] > EBAY_ITEM_CRAWLING_INTERVAL:
-                        item = crawlEbayItem(item['url'])
-                        items[i] = item
     log.debug("Done checking items...")
 
 def crawlEbayItem(url):
     if not hasattr(crawlEbayItem, 'htmlparser'):
         crawlEbayItem.htmlparser = etree.HTMLParser()  # static local variable
     
-    newItem = {'url': url}
-
     log.debug("Crawling url: %s" % url)
     
-    now = datetime.now(TZ_CET)
-    
-    newItem['last_crawled'] = now
+    newItem = {'url': url}
     
     response = urlopen(url)
     tree = etree.parse(response, crawlEbayItem.htmlparser)
@@ -154,7 +116,7 @@ def crawlEbayItem(url):
         # but the target locale must be installed on the system
         #endDate = datetime.strptime(endDate, '%d %b %Y %H:%M:%S').replace(tzinfo=TZ_CET) 
     else:
-        endDate = None
+        raise "Oggetto senza scadenza, non tracciabile"
     #print(endDate)
     
     newItem['end_date'] = endDate
@@ -201,34 +163,116 @@ def crawlEbayItem(url):
     
     return newItem
 
-def listEbayItems(chat_id):
-    if data['ebay_items']:
-        log.debug("Listing items")
-        i=1
-        for item in data['ebay_items']:
-            sendItemMessage(chat_id, item, str(i) + ') ')
-            i += 1
-        log.debug("Done listing")
+def printEbayURLs(chat_id):
+    log.debug("Printing URLs")
+    events = listCalendarEvents()
+    if events:
+        msg = ''
+        for event in events:
+            with suppress(KeyError):
+                msg += event['source']['url'] + '\n'
+        bot.sendMessage(chat_id, msg[:-1])
     else:
         bot.sendMessage(chat_id, "Non ci sono oggetti Ebay tracciati")
-
-def trackEbayItem(chat_id, url):
-    if urlValidator(url):
-        log.debug("Tracking new item: %s" % url)
-        try:
-            url = url.partition('?')[0]
-            if any(x['url'] == url for x in data['ebay_items']):
-                bot.sendMessage(chat_id, "L'oggetto era già tracciato!")
-            else:
-                item = crawlEbayItem(url)
-                data['ebay_items'].append(item)
-                writeDB(data)
-                bot.sendMessage(chat_id, "Oggetto tracciato correttamente")
-        except IndexError:
-            bot.sendMessage(chat_id, "Impossibile leggere i dati dalla pagina Ebay")
-        log.debug("Done tracking")
+    log.debug("Done listing")
+        
+def listEbayItems(chat_id):
+    log.debug("Listing items")
+    events = listCalendarEvents()
+    if events:
+        i=1
+        for event in events:
+            bot.sendMessage(chat_id, str(i) + ') ' + event['description'], parse_mode="html")
+            i += 1
     else:
-        bot.sendMessage(chat_id, "URL non valido")
+        bot.sendMessage(chat_id, "Non ci sono oggetti Ebay tracciati")
+    log.debug("Done listing")
+
+def getUrlMd5(url):
+    return hashlib.md5(url.encode('utf-8')).hexdigest()
+    
+def createEvent(item):
+    event = {
+      'summary': 'Asta Ebay',
+      'description': createItemDescription(item),
+      'start': {
+        'dateTime': item['end_date'].isoformat(),
+        'timeZone': 'Europe/Rome',
+      },
+      'end': {
+        'dateTime': item['end_date'].isoformat(),
+        'timeZone': 'Europe/Rome',
+      },
+      'reminders': {
+        'useDefault': False,
+        'overrides': [
+          {'method': 'popup', 'minutes': 10},
+        ],
+      },
+      'source': {
+        'url': item['url'], 
+      },
+      'extendedProperties': {
+        'private': {
+          'item_url_md5': getUrlMd5(item['url']),
+          'last_crawled': datetime.now(TZ_CET).isoformat(),
+        },
+      },
+    }
+    return event
+
+def listCalendarEvents():
+    events_result = google_cal_service.events().list(calendarId=data['calendar_id'], timeMin=datetime.now(TZ_CET).isoformat(), maxResults=100, singleEvents=True, orderBy='startTime').execute()
+    events = events_result.get('items', [])
+    return events
+
+def isCalendarEventPresent(url):
+    events_result = google_cal_service.events().list(calendarId=data['calendar_id'], maxResults=1, privateExtendedProperty="item_url_md5="+getUrlMd5(url), singleEvents=True).execute()
+    events = events_result.get('items', [])
+    return len(events) > 0
+    
+def addCalendarEvent(item):
+    event = createEvent(item)
+    event = google_cal_service.events().insert(calendarId=data['calendar_id'], body=event).execute()
+
+def updateCalendarEvent(item):
+    events_result = google_cal_service.events().list(calendarId=data['calendar_id'], maxResults=1, privateExtendedProperty="item_url_md5="+getUrlMd5(item['url']), singleEvents=True).execute()
+    events = events_result.get('items', [])
+
+    if events:
+        event = createEvent(item)
+        event = google_cal_service.events().update(calendarId=data['calendar_id'], eventId=events[0]['id'], body=event).execute()
+
+def deleteCalendarEvent(urlMd5):
+    events_result = google_cal_service.events().list(calendarId=data['calendar_id'], maxResults=1, privateExtendedProperty="item_url_md5="+urlMd5, singleEvents=True).execute()
+    events = events_result.get('items', [])
+
+    if events:
+        google_cal_service.events().delete(calendarId=data['calendar_id'], eventId=events[0]['id']).execute()
+
+def trackEbayItem(chat_id, urls):
+    urls = urls.split('\n')
+    for url in urls:
+        if urlValidator(url):
+            log.debug("Tracking new item: %s" % url)
+            try:
+                url = url.partition('?')[0]
+                if isCalendarEventPresent(url):
+                    bot.sendMessage(chat_id, "L'oggetto era già tracciato!")
+                else:
+                    item = crawlEbayItem(url)
+                    addCalendarEvent(item)
+                    bot.sendMessage(chat_id, "Oggetto tracciato correttamente")
+            except IndexError:
+                bot.sendMessage(chat_id, "Impossibile leggere i dati dalla pagina Ebay")
+                log.error(traceback.format_exc())
+            except HttpError:
+                bot.sendMessage(chat_id, "Errore durante l'aggiunta dell'evento al calendario")
+                log.error(traceback.format_exc())
+                
+            log.debug("Done tracking")
+        else:
+            bot.sendMessage(chat_id, "URL non valido: " + url)
 
 def chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
@@ -236,12 +280,14 @@ def chunks(lst, n):
         yield lst[i:i + n]
         
 def removeEbayItem(chat_id):
-    if data['ebay_items']:
+    events = listCalendarEvents()
+    if events:
         log.debug("Listing items to remove")
         buttons = []
         i=1
-        for item in data['ebay_items']:
-            buttons.append(InlineKeyboardButton(text=str(i), callback_data=hashlib.md5(item['url'].encode('utf-8')).hexdigest()))
+        for event in events:
+            with suppress(KeyError):
+                buttons.append(InlineKeyboardButton(text=str(i), callback_data=getUrlMd5(event['source']['url'])))
             i += 1
     
         bot.sendMessage(chat_id, "Quali oggetti vuoi rimuovere?", reply_markup=InlineKeyboardMarkup(inline_keyboard=list(chunks(buttons, 8))))
@@ -249,22 +295,6 @@ def removeEbayItem(chat_id):
     else:
         bot.sendMessage(chat_id, "Non ci sono oggetti Ebay tracciati")
 
-def removeEbayExpiredItems(chat_id):
-    now = datetime.now(TZ_CET)
-    
-    log.debug("Removing expired items: %s" % str(now))
-    items = data['ebay_items']
-    old_len = len(items)
-    items[:] = [x for x in items if x['end_date'] is None or x['end_date'] > now]
-    
-    if len(items) < old_len:
-        writeDB(data)
-        bot.sendMessage(chat_id, "%d oggetti eliminati" % (old_len - len(items)))
-    else:
-        bot.sendMessage(chat_id, "Nessun oggetto eliminato")
-        
-    log.debug("Done removing expired items")
-    
 def on_chat_message(msg):
     global status
     content_type, chat_type, chat_id = telepot.glance(msg)
@@ -281,10 +311,10 @@ def on_chat_message(msg):
                 listEbayItems(chat_id)
             elif msg['text'] == '/track':
                 bot.sendMessage(chat_id, "Inserisci l'URL di un oggetto Ebay")
+            elif msg['text'] == '/printurls':
+                printEbayURLs(chat_id)
             elif msg['text'] == '/remove':
                 removeEbayItem(chat_id)
-            elif msg['text'] == '/remove_expired':
-                removeEbayExpiredItems(chat_id)
             else:
                 trackEbayItem(chat_id, msg['text'])
         except:
@@ -297,22 +327,18 @@ def on_callback_query(msg):
     query_id, from_id, query_data = telepot.glance(msg, flavor='callback_query')
     log.debug("Received callback query. Query id: %s, from id: %s, query data: %s" % (query_id, from_id, query_data))
 
-    items = data['ebay_items']
-    old_len = len(items)
-    items[:] = [x for x in items if not hashlib.md5(x['url'].encode('utf-8')).hexdigest() == query_data]
-    
-    if len(items) < old_len:
-        writeDB(data)
+    try:
+        deleteCalendarEvent(query_data)
         bot.answerCallbackQuery(query_id, text="Oggetto eliminato")
-    else:
+    except HttpError:
         bot.answerCallbackQuery(query_id, text="Oggetto non trovato!")
-    
+
     log.debug("Done callback query")
 
 script_dir = os.path.dirname(os.path.realpath(__file__))
 os.chdir(script_dir)
 
-log = setup_custom_logger('ebay-bot', logging.INFO)
+log = setup_custom_logger('ebay-bot', logging.DEBUG)
 
 log.info ("---------------------------------------------------")
 log.info ("Starting bot...")
@@ -321,11 +347,34 @@ data = readDB()
 
 translator = google_translator()
 
+# Google Calendar API initialization
+google_creds = None
+# The file token.json stores the user's access and refresh tokens, and is
+# created automatically when the authorization flow completes for the first
+# time.
+if os.path.exists('ebay-tracking-bot_google_token.json'):
+    google_creds = Credentials.from_authorized_user_file('ebay-tracking-bot_google_token.json', GOOGLE_API_SCOPES)
+# If there are no (valid) credentials available, let the user log in.
+if not google_creds or not google_creds.valid:
+    if google_creds and google_creds.expired and google_creds.refresh_token:
+        google_creds.refresh(Request())
+    else:
+        flow = InstalledAppFlow.from_client_secrets_file(
+            'ebay-tracking-bot_google_client_secret.json', SCOPES)
+        google_creds = flow.run_local_server(port=0)
+    # Save the credentials for the next run
+    with open('ebay-tracking-bot_google_token.json', 'w') as token:
+        token.write(google_creds.to_json())
+
+google_cal_service = build('calendar', 'v3', credentials=google_creds)
+
+# Bot initialization
 bot = telepot.Bot(data['telegram_token'])
 MessageLoop(bot, {'chat': on_chat_message, 'callback_query': on_callback_query}).run_as_thread()
 
 log.info ("Bot started. Listening ...")
 
+# Item check sheduling
 schedule.every(2).minutes.do(checkEbayItems)
 
 # Keep the program running.
